@@ -1,17 +1,17 @@
-# QL_Diem_HS.py
+# QL_Diem_HS (Upgraded UI Edition)
 # -*- coding: utf-8 -*-
 import os, sys, csv
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, colorchooser
 
 # Excel
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 # Biểu đồ
 import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator  # trục Y hiển thị số nguyên
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 
 # Load .env if present
@@ -106,7 +106,7 @@ def update_histograms_from_raw():
     for s in TIN_RAW:  TIN[_bucket_index(s)]  += 1
     for s in TB_RAW:   TB[_bucket_index(s)]   += 1
 
-# ---------- AI helpers (đặt trước open_qna_window để tránh 'not defined') ----------
+# ---------- AI helpers (để giữ tương thích với nền cũ) ----------
 def _ai__summarize_records(records, limit_rows=15):
     if not records:
         return "Bảng hiện đang trống."
@@ -199,28 +199,42 @@ def _ai__ask_chatgpt(question: str, context: str = "", temperature: float = 0.2,
 class StudentManagerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Quản lý điểm học sinh (6 môn)")
-        self.root.geometry("1200x760")
+        self.root.title("Quản lý điểm học sinh")
+        self.root.geometry("1280x800")
 
         # Trạng thái giao diện
         self.dark_mode = False
         self.buttons: list[tuple[tk.Button, str, str, str]] = []  # (btn, bg, fg, active_bg)
+        self.sort_state = {}  # cột -> asc/desc
+        self.display_columns = ["stt","id","ho_ten","lop"] + SUBJECTS + ["diem_tb","xep_loai"]
 
         # Dữ liệu
         self.students = []
         self.next_id = 1
+
+        # KPI variables
+        self.kpi_total = tk.StringVar(value="0")
+        self.kpi_visible = tk.StringVar(value="0")
+        self.kpi_gioi = tk.StringVar(value="0")
+        self.kpi_kha = tk.StringVar(value="0")
+        self.kpi_tb = tk.StringVar(value="0")
+        self.kpi_yeu = tk.StringVar(value="0")
 
         # Theme gốc
         self._setup_theme()
 
         # UI
         self._build_header()
+        self._build_kpis()           # NEW: dải KPI
         self._build_form()
         self._build_buttons()
         self._build_search()
         self._build_table()
         self._build_statusbar()
         self._set_status("Sẵn sàng.")
+
+        # Shortcuts
+        self._bind_shortcuts()
 
     # ---------- THEME ----------
     def _setup_theme(self):
@@ -237,6 +251,10 @@ class StudentManagerGUI:
         style.configure("TFrame", background=self.bg_light)
         style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"),
                         foreground=self.primary, background=self.bg_light)
+        style.configure("KPI.TLabel", font=("Segoe UI", 11, "bold"),
+                        foreground=self.text_dark, background=self.bg_light)
+        style.configure("KPINum.TLabel", font=("Segoe UI", 16, "bold"),
+                        foreground=self.primary, background=self.bg_light)
         style.configure("TLabel", background=self.bg_light, foreground=self.text_dark, font=("Segoe UI", 10))
         style.configure("TLabelframe", background=self.bg_light)
         style.configure("TLabelframe.Label", background=self.bg_light, foreground=self.text_dark,
@@ -252,31 +270,44 @@ class StudentManagerGUI:
     def _apply_dark_palette(self):
         style = ttk.Style()
         bg = "#1e1e1e"; fg = "#f5f5f5"
-
+        
         self.root.configure(bg=bg)
         style.configure("TFrame", background=bg)
         style.configure("TLabelframe", background=bg)
         style.configure("TLabelframe.Label", background=bg, foreground=fg)
         style.configure("TLabel", background=bg, foreground=fg)
         style.configure("Title.TLabel", background=bg, foreground="#90caf9")
+        style.configure("KPI.TLabel", background=bg, foreground=fg)
+        style.configure("KPINum.TLabel", background=bg, foreground="#90caf9")
         style.configure("TEntry", fieldbackground="#333333", foreground=fg, background="#333333")
         style.configure("TCombobox", fieldbackground="#333333", foreground=fg, background="#333333")
         style.configure("Treeview", background="#2d2d2d", fieldbackground="#2d2d2d", foreground=fg)
         style.configure("Treeview.Heading", background="#3a3a3a", foreground=fg)
 
+
+        # đồng bộ màu nền cho vùng nút có thanh cuộn
+        if hasattr(self, "btn_canvas"):
+            try:
+                self.btn_canvas.configure(bg=bg)
+            except: pass
+        if hasattr(self, "btn_frame"):
+            try:
+                self.btn_frame.configure(bg=bg)
+            except: pass
         if hasattr(self, "logo_lbl"):
             try: self.logo_lbl.configure(bg=bg)
             except: pass
 
         if hasattr(self, "tree"):
-            self.tree.tag_configure("oddrow",  background="#1f1f1f", foreground=fg)
-            self.tree.tag_configure("evenrow", background="#262626", foreground=fg)
+            self._configure_row_tags(dark=True)
 
         for btn, _bg, _fg, _abg in self.buttons:
             try: btn.config(bg="#333333", fg="#f5f5f5", activebackground="#555555")
             except: pass
 
     def _apply_light_palette(self):
+        bg = "#1e1e1e"
+
         self._setup_theme()
         self.root.configure(bg=self.bg_light)
         for w in self.root.winfo_children():
@@ -292,13 +323,33 @@ class StudentManagerGUI:
             except:
                 pass
 
+
+        # đồng bộ màu nền cho vùng nút có thanh cuộn
+        if hasattr(self, "btn_canvas"):
+            try:
+                self.btn_canvas.configure(bg=bg)
+            except: pass
+        if hasattr(self, "btn_frame"):
+            try:
+                self.btn_frame.configure(bg=bg)
+            except: pass
         if hasattr(self, "logo_lbl"):
             try: self.logo_lbl.configure(bg=self.bg_light)
             except: pass
 
+        # đồng bộ màu nền cho vùng nút có thanh cuộn
+        if hasattr(self, "btn_canvas"):
+            try:
+                self.btn_canvas.configure(bg=self.bg_light)
+            except: pass
+        if hasattr(self, "btn_frame"):
+            try:
+                self.btn_frame.configure(bg=self.bg_light)
+            except: pass
+
+
         if hasattr(self, "tree"):
-            self.tree.tag_configure("oddrow",  background="#ffffff", foreground="#000000")
-            self.tree.tag_configure("evenrow", background="#e3f2fd", foreground="#000000")
+            self._configure_row_tags(dark=False)
 
         for btn, bgc, fgc, abg in self.buttons:
             try:
@@ -306,13 +357,60 @@ class StudentManagerGUI:
             except Exception:
                 pass
 
-    def toggle_dark_mode(self):
+    def _configure_row_tags(self, dark: bool):
+        # màu theo xếp loại
+        if dark:
+            self.tree.tag_configure("rank_gioi",  background="#113d1d", foreground="#e8ffe8")
+            self.tree.tag_configure("rank_kha",   background="#0d2d4a", foreground="#e8f4ff")
+            self.tree.tag_configure("rank_tb",    background="#453e13", foreground="#fffce8")
+            self.tree.tag_configure("rank_yeu",   background="#4a1010", foreground="#ffe8e8")
+            self.tree.tag_configure("oddrow",  background="#1f1f1f", foreground="#f5f5f5")
+            self.tree.tag_configure("evenrow", background="#262626", foreground="#f5f5f5")
+        else:
+            self.tree.tag_configure("rank_gioi",  background="#E8F5E9", foreground="#1b5e20")
+            self.tree.tag_configure("rank_kha",   background="#E3F2FD", foreground="#0b3060")
+            self.tree.tag_configure("rank_tb",    background="#FFF8E1", foreground="#6d4c00")
+            self.tree.tag_configure("rank_yeu",   background="#FFEBEE", foreground="#b71c1c")
+            self.tree.tag_configure("oddrow",  background="#ffffff", foreground="#000000")
+            self.tree.tag_configure("evenrow", background="#f6fbff", foreground="#000000")
+
+    def toggle_dark_mode(self, *_):
         self.dark_mode = not self.dark_mode
         if self.dark_mode:
             self._apply_dark_palette()
         else:
             self._apply_light_palette()
         self._set_status("Đã đổi chế độ giao diện.")
+
+    def _color_picker(self):
+        color = colorchooser.askcolor(title="Chọn màu chủ đạo (Primary)")
+        if not color or not color[1]:
+            return
+        self.primary = color[1]
+        # làm tối một chút cho active
+        self.primary_dark = self.primary
+        try:
+            import colorsys
+            r = int(self.primary[1:3],16)/255
+            g = int(self.primary[3:5],16)/255
+            b = int(self.primary[5:7],16)/255
+            h,l,s = colorsys.rgb_to_hls(r,g,b)
+            l = max(0, l-0.15)
+            r2,g2,b2 = colorsys.hls_to_rgb(h,l,s)
+            self.primary_dark = f"#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}"
+        except Exception:
+            pass
+        self._setup_theme()
+        # cập nhật màu cho tree heading
+        style = ttk.Style()
+        style.configure("Treeview.Heading", background=self.primary, foreground="white")
+        # cập nhật màu cho các nút đã tạo
+        for btn, _, _, _ in self.buttons:
+            try:
+                btn.configure(activebackground=self.primary_dark)
+            except:
+                pass
+        self._set_status(f"Đã đổi màu chủ đạo: {self.primary}")
 
     # ---------- HEADER ----------
     def _build_header(self):
@@ -329,7 +427,28 @@ class StudentManagerGUI:
                 self.logo_lbl.pack(side="left", padx=(0,10))
         except Exception:
             pass
-        ttk.Label(h, text="Quản lý điểm học sinh (6 môn)", style="Title.TLabel").pack(side="left")
+        ttk.Label(h, text="Quản lý điểm học sinh", style="Title.TLabel").pack(side="left")
+
+        # đổi màu chủ đạo nhanh
+        tk.Button(h, text="🎨 Đổi màu", command=self._color_picker, bg="#455a64", fg="white",
+                  activebackground="#37474f", padx=10, pady=5).pack(side="right", padx=(8,0))
+
+    # ---------- KPI STRIP ----------
+    def _build_kpis(self):
+        k = ttk.Frame(self.root); k.pack(fill="x", padx=12, pady=(0,6))
+
+        def card(parent, title, var):
+            f = ttk.Frame(parent, padding=8); f.pack(side="left", padx=6)
+            ttk.Label(f, text=title, style="KPI.TLabel").pack(anchor="w")
+            ttk.Label(f, textvariable=var, style="KPINum.TLabel").pack(anchor="w")
+            return f
+
+        card(k, "Tổng số học sinh", self.kpi_total)
+        card(k, "Số Học sinh hiển thị", self.kpi_visible)
+        card(k, "Giỏi", self.kpi_gioi)
+        card(k, "Khá", self.kpi_kha)
+        card(k, "Trung bình", self.kpi_tb)
+        card(k, "Yếu", self.kpi_yeu)
 
     # ---------- FORM ----------
     def _build_form(self):
@@ -347,10 +466,22 @@ class StudentManagerGUI:
             r = 1 + (i // 3)
             c = (i % 3) * 2
             ttk.Label(frm, text=f"{subj.capitalize()}:").grid(row=r, column=c, sticky="w", padx=6, pady=4)
+            # Giữ Entry để tương thích (nền cũ), nhưng bật validate điểm
             e = ttk.Entry(frm, width=6); e.grid(row=r, column=c+1, padx=6, pady=4)
+            e.configure(validate="key", validatecommand=(frm.register(self._validate_score), "%P"))
             self.ent_scores[subj] = e
 
         for col in range(6): frm.grid_columnconfigure(col, weight=1)
+
+    def _validate_score(self, s):
+        if s.strip()=="":
+            return True
+        s = s.replace(",", ".")
+        try:
+            v = float(s)
+            return 0.0 <= v <= 10.0
+        except:
+            return False
 
     # ---------- ICONS (tùy chọn) ----------
     def _load_icon(self, name):
@@ -362,10 +493,48 @@ class StudentManagerGUI:
         return None
 
     # ---------- BUTTONS ----------
-    def _build_buttons(self):
-        btnf = ttk.LabelFrame(self.root, text="Chức năng", padding=10)
-        btnf.pack(fill="x", padx=12, pady=6)
 
+    def _build_buttons(self):
+        # Khung có thanh cuộn ngang
+        outer = ttk.LabelFrame(self.root, text="Chức năng", padding=10)
+        outer.pack(fill="x", padx=12, pady=6)
+
+        # Canvas + Horizontal Scrollbar
+        self.btn_canvas = tk.Canvas(outer, height=56, highlightthickness=0, bg=self.bg_light)
+        self.btn_hsb = ttk.Scrollbar(outer, orient="horizontal", command=self.btn_canvas.xview)
+        self.btn_canvas.configure(xscrollcommand=self.btn_hsb.set)
+
+        self.btn_canvas.pack(fill="x", expand=False, side="top")
+        self.btn_hsb.pack(fill="x", side="bottom")
+
+        # Frame chứa nút, nằm trong Canvas
+        self.btn_frame = tk.Frame(self.btn_canvas, bg=self.bg_light)
+        self.btn_window = self.btn_canvas.create_window((0, 0), window=self.btn_frame, anchor="nw")
+
+        def _on_frame_configure(_evt=None):
+            # Cập nhật vùng scroll khi nội dung đổi kích thước
+            self.btn_canvas.configure(scrollregion=self.btn_canvas.bbox("all"))
+        self.btn_frame.bind("<Configure>", _on_frame_configure)
+
+        def _on_canvas_resize(_evt=None):
+            # Giữ khung nút cao và đủ rộng để không dồn dòng
+            self.btn_canvas.itemconfig(self.btn_window, height=self.btn_frame.winfo_height())
+        self.btn_canvas.bind("<Configure>", _on_canvas_resize)
+
+        # Kéo ngang bằng Shift + con lăn chuột
+        def _on_shift_wheel(evt):
+            try:
+                delta = evt.delta
+                # Windows/Mac: evt.delta = ±120 multiples
+                step = -1 if delta > 0 else 1
+            except Exception:
+                step = 1
+            self.btn_canvas.xview_scroll(step, "units")
+        self.btn_canvas.bind_all("<Shift-MouseWheel>", _on_shift_wheel)
+
+        # Nếu muốn kéo bằng chuột giữa (nhấn giữ) cũng có thể thêm sau
+
+        # Tải icon (nếu có)
         ic_add    = self._load_icon("add.png")
         ic_edit   = self._load_icon("edit.png")
         ic_delete = self._load_icon("delete.png")
@@ -374,29 +543,32 @@ class StudentManagerGUI:
         ic_excel  = self._load_icon("excel.png")
         ic_clear  = self._load_icon("clear.png")
         ic_chart  = self._load_icon("chart.png")
+        ic_cols   = self._load_icon("columns.png")
 
         def mkbtn(text, cmd, bg, icon=None, fallback=""):
             label = f" {text}" if icon else f"{fallback} {text}"
-            b = tk.Button(btnf, text=label, image=icon, compound="left",
-                    command=cmd, bg=bg, fg="white",
-                    activebackground=self.primary_dark,
-                    font=("Segoe UI", 10, "bold"), padx=10, pady=5)
+            b = tk.Button(self.btn_frame, text=label, image=icon, compound="left",
+                command=cmd, bg=bg, fg="white",
+                activebackground=self.primary_dark,
+                font=("Segoe UI", 10, "bold"), padx=10, pady=5)
             b.pack(side="left", padx=6)
             self.buttons.append((b, bg, "white", self.primary_dark))
             return b
 
-        mkbtn("Thêm", self.add_student, self.primary, ic_add, "➕")
-        mkbtn("Sửa", self.edit_student, self.primary, ic_edit, "✏️")
-        mkbtn("Xóa", self.delete_student, self.primary, ic_delete, "🗑️")
-        mkbtn("Lưu CSV…", self.save_csv, "#1565c0", ic_save, "💾")
-        mkbtn("Đọc CSV…", self.load_csv, "#1565c0", ic_open, "📂")
-        mkbtn("Xuất Excel…", self.export_excel, "#2e7d32", ic_excel, "📊")
-        mkbtn("Xem đồ thị…", self.show_charts, "#425862", ic_chart, "📈")
-        mkbtn("Biểu đồ 3 khối", self.show_block_chart, "#455a64", ic_chart, "🏫")  # nút mới
-        mkbtn("Hỏi AI (Q&A)", lambda: open_qna_window(self.root, get_subset_callable=self._get_visible_subset), "#6a1b9a", None, "🤖")
-        mkbtn("Dark Mode", self.toggle_dark_mode, self.primary, None, "🌙")
+        mkbtn("Thêm (Ctrl+N)", self.add_student, self.primary, ic_add, "➕")
+        mkbtn("Sửa (Ctrl+E)", self.edit_student, self.primary, ic_edit, "✏️")
+        mkbtn("Xóa (Del)", self.delete_student, self.primary, ic_delete, "🗑️")
+        mkbtn("Lưu (Ctrl+S)", self.save_csv, "#1565c0", ic_save, "💾")
+        mkbtn("Đọc (Ctrl+O)", self.load_csv_or_xlsx, "#1565c0", ic_open, "📂")
+        mkbtn("Xuất File", lambda: self.export_excel(subset_only=False), "#2e7d32", ic_excel, "📊")
+        mkbtn("Xuất File đang hiển thị", lambda: self.export_excel(subset_only=True), "#388e3c", ic_excel, "📑")
+        mkbtn("Biểu đồ", self.show_charts, "#425862", ic_chart, "📈")
+        mkbtn("Biểu đồ 3 khối", self.show_block_chart, "#455a64", ic_chart, "🏫")
+        mkbtn("Ẩn/Hiện cột", self.toggle_columns_dialog, "#546e7a", ic_cols, "🧩")
+        mkbtn("Hỏi AI (Ctrl+Q)", lambda: open_qna_window(self.root, get_subset_callable=self._get_visible_subset), "#6a1b9a", None, "🤖")
+        mkbtn("Dark Mode (Ctrl+D)", self.toggle_dark_mode, self.primary, None, "🌙")
 
-        b_clear = tk.Button(btnf, text=(" Xóa form" if ic_clear else "🧹 Xóa form"),
+        b_clear = tk.Button(self.btn_frame, text=(" Xóa form" if ic_clear else "🧹 Xóa form"),
                             image=ic_clear, compound="left",
                             command=self.clear_form, bg="#90caf9", fg="#0b3060",
                             activebackground="#64b5f6",
@@ -434,14 +606,14 @@ class StudentManagerGUI:
         ttk.Label(sf, text="Giá trị:").pack(side="left", padx=(10,0))
         self.ent_search = ttk.Entry(sf, width=26); self.ent_search.pack(side="left", padx=6)
 
-        b_find = tk.Button(sf, text="🔍 Tìm",
+        b_find = tk.Button(sf, text="🔍 Tìm (Ctrl+F)",
                            command=self.search_student, bg=self.primary, fg="white",
                            activebackground=self.primary_dark,
                            font=("Segoe UI", 10, "bold"), padx=10, pady=4)
         b_find.pack(side="left", padx=6)
         self.buttons.append((b_find, self.primary, "white", self.primary_dark))
 
-        b_all = tk.Button(sf, text="📋 Hiển thị tất cả",
+        b_all = tk.Button(sf, text="📋 Hiển thị tất cả (F5)",
                           command=self.refresh_table, bg=self.primary, fg="white",
                           activebackground=self.primary_dark,
                           font=("Segoe UI", 10, "bold"), padx=10, pady=4)
@@ -453,28 +625,37 @@ class StudentManagerGUI:
         wrap = ttk.Frame(self.root); wrap.pack(fill="both", expand=True, padx=12, pady=6)
         self.cols = ["stt","id","ho_ten","lop"] + SUBJECTS + ["diem_tb","xep_loai"]
         self.tree = ttk.Treeview(wrap, columns=self.cols, show="headings", height=18)
+        self.tree["displaycolumns"] = self.display_columns
 
         header_vi = {
             "stt": "STT", "id": "ID", "ho_ten": "Họ Tên", "lop": "Lớp",
             "toan": "Toán", "ly": "Lý", "hoa": "Hóa", "van": "Văn",
             "anh": "Anh", "tin": "Tin", "diem_tb": "Điểm TB", "xep_loai": "Xếp Loại"
         }
-        for key in self.cols: self.tree.heading(key, text=header_vi.get(key, key))
+        for key in self.cols:
+            self.tree.heading(key, text=header_vi.get(key, key),
+                              command=lambda k=key: self._on_sort_column(k))
 
-        self.tree.column("stt", width=60, anchor="center")
+        self.tree.column("stt", width=56, anchor="center")
         self.tree.column("id", width=70, anchor="center")
-        self.tree.column("ho_ten", width=230, anchor="w")
+        self.tree.column("ho_ten", width=240, anchor="w")
         self.tree.column("lop", width=110, anchor="center")
         for s in SUBJECTS: self.tree.column(s, width=85, anchor="e")
         self.tree.column("diem_tb", width=95, anchor="e")
         self.tree.column("xep_loai", width=110, anchor="center")
 
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew"); vsb.grid(row=0, column=1, sticky="ns")
+        hsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
         wrap.rowconfigure(0, weight=1); wrap.columnconfigure(0, weight=1)
 
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<Button-3>", self._on_right_click)
+
+        self._configure_row_tags(dark=False)
 
     # ---------- STATUS ----------
     def _build_statusbar(self):
@@ -482,6 +663,23 @@ class StudentManagerGUI:
         bar = ttk.Frame(self.root); bar.pack(fill="x", side="bottom")
         ttk.Label(bar, textvariable=self.status, anchor="w").pack(fill="x", padx=12, pady=4)
     def _set_status(self, msg): self.status.set(msg)
+
+    # ---------- SHORTCUTS ----------
+    def _bind_shortcuts(self):
+        self.root.bind("<Control-n>", lambda e: self.add_student())
+        self.root.bind("<Control-N>", lambda e: self.add_student())
+        self.root.bind("<Control-e>", lambda e: self.edit_student())
+        self.root.bind("<Control-E>", lambda e: self.edit_student())
+        self.root.bind("<Delete>",    lambda e: self.delete_student())
+        self.root.bind("<Control-s>", lambda e: self.save_csv())
+        self.root.bind("<Control-S>", lambda e: self.save_csv())
+        self.root.bind("<Control-o>", lambda e: self.load_csv_or_xlsx())
+        self.root.bind("<Control-O>", lambda e: self.load_csv_or_xlsx())
+        self.root.bind("<Control-d>", self.toggle_dark_mode)
+        self.root.bind("<Control-D>", self.toggle_dark_mode)
+        self.root.bind("<Control-f>", lambda e: (self.ent_search.focus_set(), "break"))
+        self.root.bind("<F5>",        lambda e: self.refresh_table())
+        self.root.bind("<Control-q>", lambda e: open_qna_window(self.root, get_subset_callable=self._get_visible_subset))
 
     # ---------- HELPERS ----------
     def clear_form(self):
@@ -502,6 +700,58 @@ class StudentManagerGUI:
 
     def _collect_scores(self):
         return {s: parse_score_any(e.get()) for s, e in self.ent_scores.items()}
+
+    def _on_sort_column(self, col):
+        # Bỏ qua cột STT vì là thứ tự hiển thị
+        if col == "stt":
+            return
+        ascending = self.sort_state.get(col, True)
+        key_fn = None
+        if col in SUBJECTS + ["diem_tb"]:
+            key_fn = lambda s: float(s.get(col, 0.0))
+        elif col in ["id"]:
+            key_fn = lambda s: int(s.get(col, 0))
+        else:
+            key_fn = lambda s: str(s.get(col, "")).lower()
+        self.students.sort(key=key_fn, reverse=not ascending)
+        self.sort_state[col] = not ascending
+        self.refresh_table()
+        self._set_status(f"Sắp xếp theo '{col}' ({'↑' if ascending else '↓'})")
+
+    def _on_right_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.tree.selection_set(iid)
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="✏️ Sửa", command=self.edit_student)
+        menu.add_command(label="🗑️ Xóa", command=self.delete_student)
+        menu.add_separator()
+        menu.add_command(label="📋 Copy hàng", command=self._copy_selected_row)
+        menu.add_command(label="📋 Copy ô", command=lambda: self._copy_cell(event))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_selected_row(self):
+        sel = self.tree.selection()
+        if not sel: return
+        vals = self.tree.item(sel[0])["values"]
+        txt = "; ".join(str(v) for v in vals)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+        self._set_status("Đã copy hàng.")
+
+    def _copy_cell(self, event):
+        col = self.tree.identify_column(event.x)  # e.g. '#3'
+        row = self.tree.identify_row(event.y)
+        if not col or not row: return
+        idx = int(col.replace("#","")) - 1
+        vals = self.tree.item(row)["values"]
+        if idx < 0 or idx >= len(vals): return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(str(vals[idx]))
+        self._set_status("Đã copy ô.")
 
     # ---------- CRUD ----------
     def add_student(self):
@@ -540,7 +790,7 @@ class StudentManagerGUI:
         self.students = [s for s in self.students if s["id"] != sid]
         self.refresh_table(); self._set_status(f"Đã xóa ID {sid}.")
 
-    # ---------- REFRESH TABLE + CẬP NHẬT HISTOGRAM ----------
+    # ---------- REFRESH TABLE + KPI + HISTOGRAM ----------
     def refresh_table(self, subset=None):
         for i in self.tree.get_children(): self.tree.delete(i)
 
@@ -549,17 +799,25 @@ class StudentManagerGUI:
         VAN_RAW, ANH_RAW, TIN_RAW = [], [], []
         TB_RAW = []
 
-        self.tree.tag_configure("oddrow",  background="#ffffff", foreground="#000000")
-        self.tree.tag_configure("evenrow", background="#e3f2fd", foreground="#000000")
-
         data = subset if subset is not None else self.students
         data.sort(key=lambda s: (s["lop"], s["ho_ten"]))
+
+        rank_count = {"Giỏi":0,"Khá":0,"Trung bình":0,"Yếu":0}
 
         for idx, s in enumerate(data, start=1):
             row = [idx, s["id"], s["ho_ten"], s["lop"]] + \
                   [s[subj] for subj in SUBJECTS] + [f"{s['diem_tb']:.2f}", s["xep_loai"]]
-            tag = "evenrow" if idx % 2 == 0 else "oddrow"
-            self.tree.insert("", "end", values=row, tags=(tag,))
+
+            rank_tag = {
+                "Giỏi": "rank_gioi",
+                "Khá": "rank_kha",
+                "Trung bình": "rank_tb",
+                "Yếu": "rank_yeu"
+            }.get(s["xep_loai"], "oddrow")
+            rank_count[s["xep_loai"]] = rank_count.get(s["xep_loai"],0) + 1
+
+            zebra = "evenrow" if idx % 2 == 0 else "oddrow"
+            self.tree.insert("", "end", values=row, tags=(zebra, rank_tag))
 
             TOAN_RAW.append(s["toan"]); LI_RAW.append(s["ly"]); HOA_RAW.append(s["hoa"])
             VAN_RAW.append(s["van"]); ANH_RAW.append(s["anh"]); TIN_RAW.append(s["tin"])
@@ -567,11 +825,18 @@ class StudentManagerGUI:
 
         update_histograms_from_raw()
 
-        if self.dark_mode:
-            self.tree.tag_configure("oddrow",  background="#1f1f1f", foreground="#f5f5f5")
-            self.tree.tag_configure("evenrow", background="#262626", foreground="#f5f5f5")
+        # KPI update
+        self.kpi_total.set(str(len(self.students)))
+        self.kpi_visible.set(str(len(data)))
+        self.kpi_gioi.set(str(rank_count.get("Giỏi",0)))
+        self.kpi_kha.set(str(rank_count.get("Khá",0)))
+        self.kpi_tb.set(str(rank_count.get("Trung bình",0)))
+        self.kpi_yeu.set(str(rank_count.get("Yếu",0)))
 
-    # ---------- SEARCH THƯỜNG ----------
+        # theme row tags
+        self._configure_row_tags(self.dark_mode)
+
+    # ---------- TÌM KIẾM THƯỜNG ----------
     def search_student(self):
         crit = self.cmb_criteria.get(); q = self.ent_search.get().strip()
         if not q:
@@ -611,7 +876,7 @@ class StudentManagerGUI:
         self.refresh_table(filtered)
         self._set_status(f"Tìm nâng cao → {len(filtered)} kết quả.")
 
-    # ---------- CSV ----------
+    # ---------- CSV / XLSX ----------
     def save_csv(self):
         path = filedialog.asksaveasfilename(defaultextension=".csv",
                                             filetypes=[("CSV files","*.csv"), ("All files","*.*")])
@@ -632,58 +897,108 @@ class StudentManagerGUI:
         except Exception as e:
             messagebox.showerror("Lỗi", str(e))
 
-    def load_csv(self):
-        path = filedialog.askopenfilename(filetypes=[("CSV files","*.csv"), ("All files","*.*")])
+    def load_csv_or_xlsx(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV/XLSX","*.csv *.xlsx"), ("CSV","*.csv"), ("Excel","*.xlsx"), ("All files","*.*")])
         if not path: return
+        ext = os.path.splitext(path)[1].lower()
         try:
-            self.students.clear()
-            with open(path, "r", encoding="utf-8-sig", newline="") as f:
-                sample = f.read(4096); f.seek(0)
-                try:
-                    dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-                    delimiter = dialect.delimiter
-                except Exception:
-                    delimiter = ";"
-                reader = csv.DictReader(f, delimiter=delimiter, quotechar='"')
-                vi_to_en = {
-                    "id":"id","họ tên":"ho_ten","ho ten":"ho_ten",
-                    "lớp":"lop","lop":"lop","toán":"toan","toan":"toan",
-                    "lý":"ly","ly":"ly","hóa":"hoa","hoa":"hoa",
-                    "văn":"van","van":"van","anh":"anh","tin":"tin",
-                    "điểm tb":"diem_tb","diem tb":"diem_tb",
-                    "xếp loại":"xep_loai","xep loai":"xep_loai"
-                }
-                file_fields = reader.fieldnames or []
-                field_map = {}
-                for h in file_fields:
-                    k = (h or "").strip().lower()
-                    en = vi_to_en.get(k)
-                    if not en and k in ["id","ho_ten","lop","toan","ly","hoa","van","anh","tin","diem_tb","xep_loai"]:
-                        en = k
-                    if en: field_map[h] = en
-
-                for row in reader:
-                    get = lambda en_key: next((row[h] for h, en in field_map.items() if en == en_key), "")
-                    sc = {s: parse_score_any(get(s)) for s in SUBJECTS}
-                    avg = wavg(sc); xl = classify(avg)
-                    id_val = get("id")
-                    try: id_int = int(float(id_val)) if id_val != "" else len(self.students)+1
-                    except: id_int = len(self.students)+1
-                    self.students.append({
-                        "id": id_int,
-                        "ho_ten": (get("ho_ten") or "").strip(),
-                        "lop": (get("lop") or "").strip(),
-                        **sc, "diem_tb": round(avg, 2), "xep_loai": xl
-                    })
-            self.next_id = max((s["id"] for s in self.students), default=0) + 1
-            self.refresh_table()
-            self._set_status(f"Đã đọc CSV: {path} (delimiter='{delimiter}')")
+            if ext == ".xlsx":
+                self._load_xlsx(path)
+            else:
+                self._load_csv(path)
         except Exception as e:
             messagebox.showerror("Lỗi", str(e))
 
+    def _load_csv(self, path):
+        self.students.clear()
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            sample = f.read(4096); f.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+                delimiter = dialect.delimiter
+            except Exception:
+                delimiter = ";"
+            reader = csv.DictReader(f, delimiter=delimiter, quotechar='"')
+            vi_to_en = {
+                "id":"id","họ tên":"ho_ten","ho ten":"ho_ten",
+                "lớp":"lop","lop":"lop","toán":"toan","toan":"toan",
+                "lý":"ly","ly":"ly","hóa":"hoa","hoa":"hoa",
+                "văn":"van","van":"van","anh":"anh","tin":"tin",
+                "điểm tb":"diem_tb","diem tb":"diem_tb",
+                "xếp loại":"xep_loai","xep loai":"xep_loai"
+            }
+            file_fields = reader.fieldnames or []
+            field_map = {}
+            for h in file_fields:
+                k = (h or "").strip().lower()
+                en = vi_to_en.get(k)
+                if not en and k in ["id","ho_ten","lop","toan","ly","hoa","van","anh","tin","diem_tb","xep_loai"]:
+                    en = k
+                if en: field_map[h] = en
+
+            for row in reader:
+                get = lambda en_key: next((row[h] for h, en in field_map.items() if en == en_key), "")
+                sc = {s: parse_score_any(get(s)) for s in SUBJECTS}
+                avg = wavg(sc); xl = classify(avg)
+                id_val = get("id")
+                try: id_int = int(float(id_val)) if id_val != "" else len(self.students)+1
+                except: id_int = len(self.students)+1
+                self.students.append({
+                    "id": id_int,
+                    "ho_ten": (get("ho_ten") or "").strip(),
+                    "lop": (get("lop") or "").strip(),
+                    **sc, "diem_tb": round(avg, 2), "xep_loai": xl
+                })
+        self.next_id = max((s["id"] for s in self.students), default=0) + 1
+        self.refresh_table()
+        self._set_status(f"Đã đọc CSV: {path}")
+
+    def _load_xlsx(self, path):
+        self.students.clear()
+        wb = load_workbook(path, data_only=True)
+        ws = wb.active
+        # Lấy header
+        headers = []
+        for c in ws[1]:
+            headers.append((c.value or "").strip() if isinstance(c.value, str) else str(c.value or ""))
+        vi_to_en = {
+            "id":"id","họ tên":"ho_ten","ho ten":"ho_ten",
+            "lớp":"lop","lop":"lop","toán":"toan","toan":"toan",
+            "lý":"ly","ly":"ly","hóa":"hoa","hoa":"hoa",
+            "văn":"van","van":"van","anh":"anh","tin":"tin",
+            "điểm tb":"diem_tb","diem tb":"diem_tb",
+            "xếp loại":"xep_loai","xep loai":"xep_loai"
+        }
+        # map cột
+        col_map = {}
+        for idx, h in enumerate(headers):
+            k = h.strip().lower()
+            en = vi_to_en.get(k) or (k if k in ["id","ho_ten","lop","toan","ly","hoa","van","anh","tin","diem_tb","xep_loai"] else None)
+            if en:
+                col_map[idx] = en
+
+        for r in ws.iter_rows(min_row=2, values_only=True):
+            row = {col_map[i]: r[i] for i in col_map.keys() if i < len(r)}
+            get = lambda en_key, default="": row.get(en_key, default)
+            sc = {s: parse_score_any(get(s, 0)) for s in SUBJECTS}
+            avg = wavg(sc); xl = classify(avg)
+            id_val = get("id")
+            try: id_int = int(float(id_val)) if id_val not in ("", None) else len(self.students)+1
+            except: id_int = len(self.students)+1
+            self.students.append({
+                "id": id_int,
+                "ho_ten": (str(get("ho_ten") or "")).strip(),
+                "lop": (str(get("lop") or "")).strip(),
+                **sc, "diem_tb": round(avg, 2), "xep_loai": xl
+            })
+        self.next_id = max((s["id"] for s in self.students), default=0) + 1
+        self.refresh_table()
+        self._set_status(f"Đã đọc Excel: {path}")
+
     # ---------- EXCEL ----------
-    def export_excel(self):
-        if not self.students:
+    def export_excel(self, subset_only=False):
+        data = self._get_visible_subset() if subset_only else self.students
+        if not data:
             messagebox.showinfo("Trống", "Chưa có dữ liệu để xuất."); return
 
         path = filedialog.asksaveasfilename(defaultextension=".xlsx",
@@ -706,8 +1021,8 @@ class StudentManagerGUI:
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = border
 
-        data = sorted(self.students, key=lambda s: (s["lop"], s["ho_ten"]))
-        for idx, s in enumerate(data, start=1):
+        data_sorted = sorted(data, key=lambda s: (s["lop"], s["ho_ten"]))
+        for idx, s in enumerate(data_sorted, start=1):
             row_vals = [idx, s["id"], s["ho_ten"], s["lop"],
                         s["toan"], s["ly"], s["hoa"], s["van"], s["anh"], s["tin"],
                         float(f"{s['diem_tb']:.2f}"), s["xep_loai"]]
@@ -726,7 +1041,7 @@ class StudentManagerGUI:
 
         try:
             wb.save(path)
-            messagebox.showinfo("Thành công", f"Đã xuất Excel:\n{path}")
+            messagebox.showinfo("Thành công", f"Đã xuất Excel{' (đang hiển thị)' if subset_only else ''}:\n{path}")
             self._set_status(f"Đã xuất Excel: {path}")
         except Exception as e:
             messagebox.showerror("Lỗi", f"Không thể lưu Excel:\n{e}")
@@ -746,6 +1061,27 @@ class StudentManagerGUI:
             except Exception:
                 continue
         return subset
+
+    # ---------- ẨN/HIỆN CỘT ----------
+    def toggle_columns_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Ẩn/Hiện cột")
+        dlg.geometry("320x360")
+        ttk.Label(dlg, text="Chọn cột muốn hiển thị:", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=8)
+        vars_map = {}
+        for c in self.cols:
+            var = tk.BooleanVar(value=(c in self.display_columns))
+            cb = ttk.Checkbutton(dlg, text=c, variable=var)
+            cb.pack(anchor="w", padx=14, pady=2)
+            vars_map[c] = var
+        def apply():
+            shown = [c for c,v in vars_map.items() if v.get()]
+            if "stt" not in shown:
+                shown.insert(0, "stt")
+            self.display_columns = shown
+            self.tree["displaycolumns"] = shown
+            dlg.destroy()
+        ttk.Button(dlg, text="Áp dụng", command=apply).pack(pady=10)
 
     # ---------- BIỂU ĐỒ HISTOGRAM 7 MÔN ----------
     def show_charts(self):
@@ -815,7 +1151,7 @@ class StudentManagerGUI:
             pass
         plt.show()
 
-    # ---------- BIỂU ĐỒ 3 KHỐI: 4 SERIES/ MỖI BIN ----------
+    # ---------- BIỂU ĐỒ 3 KHỐI ----------
     def show_block_chart(self):
         subset = self._get_visible_subset()
         if not subset:
@@ -885,7 +1221,7 @@ class StudentManagerGUI:
         plt.tight_layout()
         plt.show()
 
-# ---------- AI Q&A WINDOW (nâng cấp: 4 tab, ngân hàng câu hỏi, Ctrl+Enter, xuất log) ----------
+# ---------- AI Q&A WINDOW (giữ nguyên từ nền cũ để tương thích) ----------
 def open_qna_window(root, get_subset_callable=None):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
@@ -893,17 +1229,13 @@ def open_qna_window(root, get_subset_callable=None):
     from datetime import datetime
     import os
 
-    # --- Toplevel riêng, KHÔNG đổi theme toàn cục ---
     win = tk.Toplevel(root)
     win.title("Hỏi AI (Q&A)")
     win.geometry("1100x740")
 
-    # ---------- Styles cục bộ cho Q&A (không ảnh hưởng app chính) ----------
-    style = ttk.Style(win)  # style gắn với toplevel này
-    # khung & tiêu đề
+    style = ttk.Style(win)
     style.configure("QnA.TLabelframe", padding=10)
     style.configure("QnA.TLabelframe.Label", font=("Segoe UI", 11, "bold"))
-    # nút màu (ttk hỗ trợ hạn chế, nhưng đủ để nhấn nhá)
     style.configure("QnA.Primary.TButton",  foreground="white", background="#1e88e5")
     style.map("QnA.Primary.TButton",
               background=[("active", "#1565c0"), ("!active", "#1e88e5")])
@@ -914,11 +1246,11 @@ def open_qna_window(root, get_subset_callable=None):
     style.map("QnA.Secondary.TButton",
               background=[("active", "#546e7a"), ("!active", "#607d8b")])
 
-    # ---------- State / log / history ----------
     log_lines = []
     history_rows = []  # (time, question, answer, idx)
 
     def log(msg: str):
+        from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         log_lines.append(line)
@@ -927,7 +1259,6 @@ def open_qna_window(root, get_subset_callable=None):
         txt_log.see("end")
         txt_log.configure(state="disabled")
 
-    # ---------- Notebook ----------
     nb = ttk.Notebook(win)
     tab_chat = ttk.Labelframe(nb, text="💬 Chat với AI", style="QnA.TLabelframe")
     tab_ctx  = ttk.Labelframe(nb, text="📄 Ngữ cảnh",   style="QnA.TLabelframe")
@@ -937,10 +1268,8 @@ def open_qna_window(root, get_subset_callable=None):
     nb.add(tab_cfg, text="Cài đặt"); nb.add(tab_log, text="Nhật ký")
     nb.pack(fill="both", expand=True, padx=10, pady=10)
 
-    # ================= TAB CHAT =================
     left = ttk.Labelframe(tab_chat, text="Ngân hàng câu hỏi", style="QnA.TLabelframe")
     left.pack(side="left", fill="y", padx=(0,10))
-
     questions = [
         "Phân tích phân bố xếp loại theo lớp.",
         "Liệt kê top 10 học sinh theo Điểm TB.",
@@ -998,19 +1327,18 @@ def open_qna_window(root, get_subset_callable=None):
             f.write("\n".join(log_lines))
         messagebox.showinfo("Xuất", f"Đã lưu log:\n{path}")
 
-    btn_ask    = ttk.Button(action, text="🤖 Hỏi AI (Ctrl+Enter)", style="QnA.Primary.TButton")
-    btn_copy   = ttk.Button(action, text="📋 Copy",                 style="QnA.Info.TButton", command=on_copy)
-    btn_export = ttk.Button(action, text="💾 Xuất log",             style="QnA.Secondary.TButton", command=on_export_log)
+    btn_ask    = ttk.Button(action, text="🤖 Hỏi AI (Ctrl+Enter)")
+    btn_copy   = ttk.Button(action, text="📋 Copy",                 command=on_copy)
+    btn_export = ttk.Button(action, text="💾 Xuất log",             command=on_export_log)
     btn_export.pack(side="right", padx=6); btn_copy.pack(side="right", padx=6); btn_ask.pack(side="right", padx=6)
 
-    # Lịch sử Q&A (panel phải)
     history = ttk.Labelframe(tab_chat, text="Lịch sử hỏi đáp", style="QnA.TLabelframe")
     history.pack(side="left", fill="y", padx=(10,0))
     tv = ttk.Treeview(history, columns=("time","q","a","idx"), show="headings", height=25)
     tv.heading("time", text="Thời gian"); tv.heading("q", text="Câu hỏi"); tv.heading("a", text="Tóm tắt trả lời")
     tv.column("time", width=85, anchor="center")
     tv.column("q", width=280, anchor="w"); tv.column("a", width=280, anchor="w")
-    tv.heading("idx", text=""); tv.column("idx", width=0, stretch=False)  # ẩn index
+    tv.heading("idx", text=""); tv.column("idx", width=0, stretch=False)
     tv.pack(fill="y", expand=True)
 
     def on_select_history(_evt=None):
@@ -1024,7 +1352,6 @@ def open_qna_window(root, get_subset_callable=None):
         txt_a.delete("1.0","end"); txt_a.insert("end", a)
     tv.bind("<<TreeviewSelect>>", on_select_history)
 
-    # ================= TAB NGỮ CẢNH =================
     txt_ctx = ScrolledText(tab_ctx, wrap="none", font=("Consolas", 10))
     txt_ctx.pack(fill="both", expand=True)
     def refresh_context():
@@ -1037,11 +1364,10 @@ def open_qna_window(root, get_subset_callable=None):
                 txt_ctx.insert("end", f"(Lỗi lấy ngữ cảnh) {e}")
         else:
             txt_ctx.insert("end", "(Không có hàm truy cập ngữ cảnh)")
-    ttk.Button(tab_ctx, text="🔄 Làm mới", style="QnA.Info.TButton", command=refresh_context)\
+    ttk.Button(tab_ctx, text="🔄 Làm mới", command=refresh_context)\
         .pack(anchor="e", pady=6)
     refresh_context()
 
-    # ================= TAB CÀI ĐẶT =================
     cfg = ttk.Frame(tab_cfg, padding=4); cfg.pack(fill="x")
     ttk.Label(cfg, text="Model (ENV OPENAI_MODEL):").grid(row=0, column=0, sticky="w", pady=6)
     model_var = tk.StringVar(value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
@@ -1062,11 +1388,9 @@ def open_qna_window(root, get_subset_callable=None):
     spn_tokens = ttk.Spinbox(cfg, from_=100, to=4000, increment=50, width=8)
     spn_tokens.insert(0, "400"); spn_tokens.grid(row=2, column=1, sticky="w", padx=8)
 
-    # ================= TAB NHẬT KÝ =================
     txt_log = ScrolledText(tab_log, wrap="word", state="disabled", font=("Segoe UI", 10))
     txt_log.pack(fill="both", expand=True)
 
-    # ---------- GỬI HỎI AI ----------
     def _shorten(s, n=80):
         s = " ".join(s.split())
         return s if len(s) <= n else s[:n-1] + "…"
@@ -1079,7 +1403,7 @@ def open_qna_window(root, get_subset_callable=None):
         txt_a.delete("1.0","end"); txt_a.insert("end", "⏳ Đang hỏi AI...\n")
 
         ctx = ""
-        if include_ctx_var.get() and callable(get_subset_callable):
+        if callable(get_subset_callable):
             try: ctx = _ai__summarize_records(get_subset_callable() or [], limit_rows=15)
             except: ctx = ""
 
@@ -1090,6 +1414,7 @@ def open_qna_window(root, get_subset_callable=None):
         ans = _ai__ask_chatgpt(q, context=ctx, temperature=temp, max_output_tokens=toks)
         txt_a.delete("1.0","end"); txt_a.insert("end", ans)
 
+        from datetime import datetime
         t = datetime.now().strftime("%H:%M:%S")
         idx = len(history_rows)
         history_rows.append((t, q, ans, idx))
@@ -1099,8 +1424,7 @@ def open_qna_window(root, get_subset_callable=None):
     btn_ask.configure(command=on_ask)
     txt_q.bind("<Control-Return>", on_ask)
 
-    log("Khởi động Q&A (ttk thuần, không đổi theme app).")
-
+    log("Khởi động Q&A.")
 # ---------- RUN ----------
 if __name__ == "__main__":
     root = tk.Tk()
