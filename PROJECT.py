@@ -1,5 +1,10 @@
-# QL_Diem_HS (Upgraded UI Edition)
+# QL_Diem_HS (Upgraded UI Edition, AI)
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+from typing import Any, TYPE_CHECKING
+if TYPE_CHECKING:
+    import pandas as _pd_check  # type: ignore
+
 import os, sys, csv
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, colorchooser
@@ -1430,3 +1435,255 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = StudentManagerGUI(root)
     root.mainloop()
+
+
+# ===========================
+# ==== AI UPGRADE START ====
+# (Self-contained; safe to append without changing existing GUI code)
+# ===========================
+
+from typing import Any, TYPE_CHECKING
+if TYPE_CHECKING:
+    import pandas as _pd_check  # type: ignore
+import re, json, math, os, time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple, Optional
+
+try:
+    import pandas as pd
+    import numpy as np
+except Exception:
+    pd = None
+    np = None
+
+# ---- tiny tokenizer ----
+_VN_STOP = {"là","và","hoặc","nhưng","thì","của","cho","với","những","các","đã","đang","sẽ","trong","tại","từ","theo","đến","về","này","kia","ấy","đó","một"}
+def _norm(s:str)->str: return re.sub(r"\s+"," ", (s or "").strip())
+def _tok(s:str)->List[str]:
+    s=_norm(s.lower())
+    return [t for t in re.findall(r"[a-zA-Z0-9_À-ỹ]+", s) if t not in _VN_STOP]
+
+# ---- minimal hybrid index (no sklearn dependency) ----
+@dataclass
+class _Doc:
+    id: str
+    text: str
+    meta: Dict[str,Any] = field(default_factory=dict)
+
+class _CounterVec:
+    def __init__(self, txt:str):
+        c={}
+        for t in _tok(txt): c[t]=c.get(t,0.0)+1.0
+        self.c=c
+def _cos(a:_CounterVec,b:_CounterVec)->float:
+    if not a.c or not b.c: return 0.0
+    keys=set(a.c)|set(b.c)
+    dot=sum(a.c.get(k,0.0)*b.c.get(k,0.0) for k in keys)
+    na=math.sqrt(sum(v*v for v in a.c.values())); nb=math.sqrt(sum(v*v for v in b.c.values()))
+    return 0.0 if na==0 or nb==0 else dot/(na*nb)
+
+class _Index:
+    def __init__(self): self.docs:List[_Doc]=[]; self.vecs:List[_CounterVec]=[]
+    def add_docs(self, docs:List[_Doc]):
+        self.docs.extend(docs); self.vecs.extend([_CounterVec(d.text) for d in docs])
+    def clear(self): self.docs.clear(); self.vecs.clear()
+    def search(self, query:str, k:int=12)->List[Tuple[_Doc,float]]:
+        if not self.docs: return []
+        qv=_CounterVec(query)
+        sims=[_cos(qv,v) for v in self.vecs]
+        order=sorted(range(len(sims)), key=lambda i:sims[i], reverse=True)[:k]
+        return [(self.docs[i], float(sims[i])) for i in order]
+
+# ---- data registry ----
+class DataRegistry:
+    tables: Dict[str,"Any"] = {}
+    index = _Index()
+    @classmethod
+    def default_table(cls)->str: return next(iter(cls.tables.keys()), "scores")
+    @classmethod
+    def clear(cls): cls.tables.clear(); cls.index.clear()
+    @classmethod
+    def feed_dataframe(cls, df:"Any", name:str="scores", file:str="inmem.xlsx", sheet:str="Sheet1"):
+        if pd is None: return
+        cls.tables[name]=df
+        docs=[]
+        for i,row in df.iterrows():
+            parts=[f"{col}: {row[col]}" for col in df.columns if not pd.isna(row[col])]
+            if parts:
+                docs.append(_Doc(f"{name}:{i}", " | ".join(map(str,parts)), {"table":name,"row":int(i),"file":file,"sheet":sheet}))
+        if docs: cls.index.add_docs(docs)
+
+# ---- tools ----
+class ToolError(Exception): pass
+
+def sql_tool(plan:Dict[str,Any]):
+    if pd is None: raise ToolError("Thiếu pandas.")
+    if not DataRegistry.tables: raise ToolError("Chưa có dữ liệu để truy vấn.")
+    t=plan.get("table") or DataRegistry.default_table()
+    if t not in DataRegistry.tables: raise ToolError(f"Bảng '{t}' không tồn tại.")
+    df=DataRegistry.tables[t].copy()
+
+    sel=plan.get("select")
+    if sel:
+        keep=[c for c in sel if c in df.columns]
+        if not keep: raise ToolError("Cột chọn không tồn tại."); df=df[keep]
+        df=df[keep]
+
+    where=plan.get("where")
+    if isinstance(where,str) and where.strip():
+        try: df=df.query(where, engine="python")
+        except Exception as e: raise ToolError(f"Lỗi lọc: {e}")
+    elif isinstance(where,dict):
+        for k,v in where.items():
+            if k in df.columns: df=df[df[k]==v]
+
+    order=plan.get("order_by") or []
+    if order:
+        cols=[]; asc=[]
+        for spec in order:
+            m=re.match(r"^\s*([^\s]+)\s*(ASC|DESC)?\s*$", str(spec), re.I)
+            if not m: continue
+            col,dir=m.group(1), (m.group(2) or "ASC").upper()
+            if col in df.columns: cols.append(col); asc.append(dir=="ASC")
+        if cols: df=df.sort_values(by=cols, ascending=asc)
+
+    lim=plan.get("limit")
+    if isinstance(lim,int) and lim>0: df=df.head(lim)
+    return df.reset_index(drop=True)
+
+def stats_tool(df:"Any", op:Dict[str,Any])->Dict[str,Any]:
+    if pd is None or df is None or df.empty: return {"summary":"Không có dữ liệu."}
+    typ=op.get("type","describe"); col=op.get("col")
+    if typ=="topk": return {"topk": df.head(int(op.get("k",30))).to_dict(orient="records")}
+    if typ=="hist" and col in df.columns:
+        series=pd.to_numeric(df[col], errors="coerce").dropna()
+        import numpy as _np
+        hist,edges=_np.histogram(series.values, bins=int(op.get("bins",10)))
+        return {"hist":hist.tolist(), "edges":[float(x) for x in edges.tolist()]}
+    return {"describe": df.describe(include="all").to_dict()}
+
+def math_tool(expr:str)->Dict[str,Any]:
+    import ast
+    from decimal import Decimal, getcontext
+    getcontext().prec=50
+    class V(ast.NodeVisitor):
+        def eval(self,n):
+            if isinstance(n,ast.Expression): return self.eval(n.body)
+            if isinstance(n,ast.Num): return Decimal(str(n.n))
+            if isinstance(n,ast.Constant) and isinstance(n.value,(int,float)): return Decimal(str(n.value))
+            if isinstance(n,ast.UnaryOp):
+                v=self.eval(n.operand)
+                return v if isinstance(n.op,ast.UAdd) else (-v if isinstance(n.op,ast.USub) else (_err()))
+            if isinstance(n,ast.BinOp):
+                a=self.eval(n.left); b=self.eval(n.right)
+                if isinstance(n.op,ast.Add): return a+b
+                if isinstance(n.op,ast.Sub): return a-b
+                if isinstance(n.op,ast.Mult): return a*b
+                if isinstance(n.op,ast.Div): return a/b
+                if isinstance(n.op,ast.FloorDiv): return a//b
+                if isinstance(n.op,ast.Mod): return a%b
+                if isinstance(n.op,ast.Pow): return a**int(b)
+                _err()
+            _err()
+    def _err(): raise ToolError("Biểu thức không hợp lệ.")
+    try:
+        tree=ast.parse(expr, mode="eval")
+        return {"ok":True,"expr":expr,"value":str(V().eval(tree))}
+    except Exception as e:
+        return {"ok":False,"expr":expr,"error":str(e)}
+
+# ---- intent ----
+def _intent(q:str)->str:
+    s=q.lower()
+    if any(k in s for k in ["lọc","tìm","thuộc lớp","trường"]): return "filter"
+    if any(k in s for k in ["xếp hạng","top","cao nhất","sắp xếp"]): return "rank"
+    if any(k in s for k in ["trung bình","thống kê","hist","phân phối","tỉ lệ"]): return "stat"
+    if any(k in s for k in ["tính","=", "+","-","*","/","^"]): return "calc"
+    return "qa"
+
+# ---- AI Engine (no GUI dependency) ----
+class AIEngine:
+    def answer(self, user_q:str)->Dict[str,Any]:
+        q=_norm(user_q)
+        mode=_intent(q)
+
+        if mode in {"filter","rank","stat"}:
+            plan,_cites=self._plan(q)
+            try: df=sql_tool(plan)
+            except Exception as e: return self._err(q,str(e))
+            view={}
+            if mode=="rank":
+                if "order_by" not in plan and pd is not None and "Điểm TB" in df.columns:
+                    df=df.sort_values(by=["Điểm TB"], ascending=False)
+                view=stats_tool(df, {"type":"topk","k": plan.get("limit",30) or 30})
+            elif mode=="stat":
+                num=[c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])] if pd is not None else []
+                col=num[0] if num else ""
+                view=stats_tool(df, {"type":"hist" if col else "describe","col":col,"bins":10})
+            else:
+                view={"rows": len(df)}
+            return {"mode":mode,"A":"Hoàn tất.","B":"Dữ liệu lấy trực tiếp từ bảng.","C":{"plan":plan},"result": (df.to_dict(orient="records") if pd is not None else []),"citations":_cites}
+
+        if mode=="calc":
+            m=re.search(r"([\d\.\+\-\*\/\^\(\)\s%//]+)", q)
+            expr=m.group(1) if m else q
+            out=math_tool(expr)
+            if out.get("ok"): return {"mode":"calc","A":f"Kết quả = {out['value']}","B":"Tính bằng math_tool.","C":{"expr":out["expr"]}}
+            return self._err(q, out.get("error","Không tính được."))
+
+        # qa via retrieval
+        pairs=DataRegistry.index.search(q, k=12)
+        if not pairs:
+            return {"mode":"qa","A":"Không có dữ liệu để trả lời.","B":"Hãy nạp bảng đang xem vào DataRegistry.feed_dataframe(...).","C":{},"citations":[]}
+        pairs=self._rerank(q,pairs,8)
+        ans=self._synth(q,pairs)
+        cites=[d.meta for d,_ in pairs]
+        return {"mode":"qa","A":ans,"B":"; ".join([f"{m.get('file','?')}[{m.get('table','?')}/{m.get('sheet','?')}]#row{m.get('row','?')}" for m in cites]),"C":{"k":len(pairs)},"citations":cites}
+
+    def _plan(self,q:str)->Tuple[Dict[str,Any],List[Dict[str,Any]]]:
+        table=DataRegistry.default_table()
+        where={}
+        m=re.search(r"(lớp|class)\s*[:=]?\s*([A-Za-z0-9]+)", q, flags=re.I)
+        if m: where["Lớp"]=m.group(2)
+        m2=re.search(r"(trường)\s*[:=]?\s*(.+)", q, flags=re.I)
+        if m2:
+            val=re.sub(r"[,;\.\s]+$","", m2.group(2).strip())
+            if val: where["Trường"]=val
+        sel=["STT","ID","Họ Tên","Lớp","Toán","Lý","Hóa","Văn","Anh","Tin","Điểm TB","Trường"]
+        order=[]
+        if any(x in q.lower() for x in ["xếp hạng","top","cao nhất","điểm cao"]):
+            subj=None
+            for s in ["Toán","Lý","Hóa","Văn","Anh","Tin","Điểm TB"]:
+                if s.lower() in q.lower(): subj=s; break
+            order=[f"{subj or 'Điểm TB'} DESC"]
+        limit=30 if "top" in q.lower() else None
+        return {"op":"select","table":table,"select":sel,"where":where,"order_by":order,"limit":limit}, [{"table":table}]
+
+    def _rerank(self,q:str,pairs:List[Tuple[_Doc,float]],k:int)->List[Tuple[_Doc,float]]:
+        picked=[]; cand=pairs[:]; qt=set(_tok(q))
+        while cand and len(picked)<k:
+            best=None; bestv=-1e9
+            for d,s in cand:
+                red=max((len(set(_tok(d.text)) & set(_tok(p[0].text))) for p in picked), default=0)+1e-6
+                qo=len(qt & set(_tok(d.text)))+1e-6
+                v=0.7*s + 0.3*(qo/10.0) - 0.1*math.log(red)
+                if v>bestv: bestv=v; best=(d,s)
+            picked.append(best); cand.remove(best)
+        return picked
+
+    def _synth(self,q:str,pairs:List[Tuple[_Doc,float]])->str:
+        bullets=[]
+        for d,_ in pairs[:4]:
+            bullets.append("- "+ (d.text[:220] + ("..." if len(d.text)>220 else "")))
+        return "Hỏi: "+q+"\nTóm tắt:\n"+("\n".join(bullets))
+
+    def _err(self,q:str,msg:str)->Dict[str,Any]:
+        return {"mode":"error","A":"Không thực hiện được.","B":f"Lý do: {msg}","C":{"question":q},"citations":[]}
+
+# Global instance + helper
+AI_ENGINE = AIEngine()
+def ai_answer(query:str)->Dict[str,Any]:
+    return AI_ENGINE.answer(query)
+# =========================
+# ==== AI UPGRADE END ====
+# =========================
